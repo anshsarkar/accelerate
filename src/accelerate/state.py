@@ -248,6 +248,13 @@ class PartialState:
 
                 if self.device is None:
                     self.device = torch.device("cpu") if cpu else self.default_device
+            # Want no distributed config - hardcoding to check the code (Will figure out later how to pass as param)
+            self.distributed_type = DistributedType.NO
+            self.num_processes = 1
+            self.process_index = self.local_process_index = 0
+
+            if self.device is None:
+                self.device = torch.device("cpu") if cpu else self.default_device
 
         self.fork_launched = parse_flag_from_env("FORK_LAUNCHED", 0)
 
