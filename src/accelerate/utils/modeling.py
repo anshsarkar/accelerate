@@ -29,8 +29,9 @@ import torch
 import torch.nn as nn
 
 from ..state import AcceleratorState
+from .constants import WEIGHTS_NAME
 from .dataclasses import DistributedType
-from .imports import is_mps_available, is_safetensors_available, is_torch_version, is_xpu_available
+from .imports import is_mps_available, is_safetensors_available, is_xpu_available
 from .offload import load_offloaded_weight, offload_weight, save_offload_index
 from .tqdm import is_tqdm_available, tqdm
 
@@ -111,6 +112,119 @@ def dtype_byte_size(dtype: torch.dtype):
     return bit_size // 8
 
 
+def id_tensor_storage(tensor: torch.Tensor) -> Tuple[torch.device, int, int]:
+    """
+    Unique identifier to a tensor storage. Multiple different tensors can share the same underlying storage. For
+    example, "meta" tensors all share the same storage, and thus their identifier will all be equal. This identifier is
+    guaranteed to be unique and constant for this tensor's storage during its lifetime. Two tensor storages with
+    non-overlapping lifetimes may have the same id.
+    """
+    _SIZE = {
+        torch.int64: 8,
+        torch.float32: 4,
+        torch.int32: 4,
+        torch.bfloat16: 2,
+        torch.float16: 2,
+        torch.int16: 2,
+        torch.uint8: 1,
+        torch.int8: 1,
+        torch.bool: 1,
+        torch.float64: 8,
+    }
+    try:
+        storage_ptr = tensor.untyped_storage().data_ptr()
+        storage_size = tensor.untyped_storage().nbytes()
+    except Exception:
+        # Fallback for torch==1.10
+        try:
+            storage_ptr = tensor.storage().data_ptr()
+            storage_size = tensor.storage().size() * _SIZE[tensor.dtype]
+        except NotImplementedError:
+            # Fallback for meta storage
+            storage_ptr = 0
+            # On torch >=2.0 this is the tensor size
+            storage_size = tensor.nelement() * _SIZE[tensor.dtype]
+
+    return tensor.device, storage_ptr, storage_size
+
+
+def shard_checkpoint(
+    state_dict: Dict[str, torch.Tensor], max_shard_size: Union[int, str] = "10GB", weights_name: str = WEIGHTS_NAME
+):
+    """
+    Splits a model state dictionary in sub-checkpoints so that the final size of each sub-checkpoint does not exceed a
+    given size.
+
+    The sub-checkpoints are determined by iterating through the `state_dict` in the order of its keys, so there is no
+    optimization made to make each sub-checkpoint as close as possible to the maximum size passed. For example, if the
+    limit is 10GB and we have weights of sizes [6GB, 6GB, 2GB, 6GB, 2GB, 2GB] they will get sharded as [6GB], [6+2GB],
+    [6+2+2GB] and not [6+2+2GB], [6+2GB], [6GB].
+
+    <Tip warning={true}>
+
+    If one of the model's weight is bigger that `max_sahrd_size`, it will end up in its own sub-checkpoint which will
+    have a size greater than `max_shard_size`.
+
+    </Tip>
+
+    Args:
+        state_dict (`Dict[str, torch.Tensor]`): The state dictionary of a model to save.
+        max_shard_size (`int` or `str`, *optional*, defaults to `"10GB"`):
+            The maximum size of each sub-checkpoint. If expressed as a string, needs to be digits followed by a unit
+            (like `"5MB"`).
+        weights_name (`str`, *optional*, defaults to `"pytorch_model.bin"`):
+            The name of the model save file.
+    """
+    max_shard_size = convert_file_size_to_int(max_shard_size)
+
+    sharded_state_dicts = [{}]
+    last_block_size = 0
+    total_size = 0
+    storage_id_to_block = {}
+
+    for key, weight in state_dict.items():
+        storage_id = id_tensor_storage(weight)
+
+        # If a `weight` shares the same underlying storage as another tensor, we put `weight` in the same `block`
+        if storage_id in storage_id_to_block:
+            block_id = storage_id_to_block[storage_id]
+            sharded_state_dicts[block_id][key] = weight
+            continue
+
+        weight_size = weight.numel() * dtype_byte_size(weight.dtype)
+
+        # If this weight is going to tip up over the maximal size, we split.
+        if last_block_size + weight_size > max_shard_size:
+            sharded_state_dicts.append({})
+            last_block_size = 0
+
+        sharded_state_dicts[-1][key] = weight
+        last_block_size += weight_size
+        total_size += weight_size
+        storage_id_to_block[storage_id] = len(sharded_state_dicts) - 1
+
+    # If we only have one shard, we return it
+    if len(sharded_state_dicts) == 1:
+        return {weights_name: sharded_state_dicts[0]}, None
+
+    # Otherwise, let's build the index
+    weight_map = {}
+    shards = {}
+    for idx, shard in enumerate(sharded_state_dicts):
+        shard_file = weights_name.replace(".bin", f"-{idx+1:05d}-of-{len(sharded_state_dicts):05d}.bin")
+        shard_file = shard_file.replace(
+            ".safetensors", f"-{idx + 1:05d}-of-{len(sharded_state_dicts):05d}.safetensors"
+        )
+        shards[shard_file] = shard
+        for key in shard.keys():
+            weight_map[key] = shard_file
+
+    # Add the metadata
+    metadata = {"total_size": total_size}
+    index = {"metadata": metadata, "weight_map": weight_map}
+    return shards, index
+
+
 def set_module_tensor_to_device(
     module: nn.Module,
     tensor_name: str,
@@ -163,6 +277,11 @@ def set_module_tensor_to_device(
     with torch.no_grad():
         if value is None:
             new_value = old_value.to(device)
+            if dtype is not None and device in ["meta", torch.device("meta")]:
+                new_value = new_value.to(dtype)
+                if not is_buffer:
+                    param_cls = type(module._parameters[tensor_name])
+                    module._parameters[tensor_name] = param_cls(new_value, requires_grad=old_value.requires_grad)
         elif isinstance(value, torch.Tensor):
             new_value = value.to(device)
         else:
@@ -259,7 +378,7 @@ def check_tied_parameters_in_config(model: nn.Module):
         has_tied_encoder_decoder = (
             hasattr(model, "config")
             and getattr(model.config, "is_encoder_decoder", False)
-            and getattr(model.config, "tie_encoder_decoder", False),
+            and getattr(model.config, "tie_encoder_decoder", False)
         )
         has_tied_module = any(hasattr(module, "_tie_weights") for module in model.modules())
 
@@ -582,7 +701,18 @@ def get_balanced_memory(
     if not is_xpu_available():
         num_devices = len([d for d in max_memory if torch.device(d).type == "cuda" and max_memory[d] > 0])
     else:
-        num_devices = len([d for d in max_memory if torch.device(d).type == "xpu" and max_memory[d] > 0])
+        num_devices = len(
+            [
+                d
+                for d in max_memory
+                if (torch.device(d).type == "xpu" or torch.xpu.get_device_properties(d).dev_type == "gpu")
+                and max_memory[d] > 0
+            ]
+        )
+
+    if num_devices == 1:
+        # We cannot do low_zero on just one GPU
+        low_zero = False
 
     module_sizes = compute_module_sizes(model, dtype=dtype, special_dtypes=special_dtypes)
     per_gpu = module_sizes[""] // (num_devices - 1 if low_zero else num_devices)
@@ -629,7 +759,7 @@ def get_balanced_memory(
     last_gpu = max(i for i in max_memory if isinstance(i, int) and max_memory[i] > 0)
     # The last device is left with max_memory just in case the buffer is not enough.
     for i in range(last_gpu):
-        max_memory[i] = min(0 if low_zero and i == 0 else per_gpu, max_memory[i])
+        max_memory[i] = min(max_memory[0] if low_zero and i == 0 else per_gpu, max_memory[i])
 
     if low_zero:
         min_zero = max(0, module_sizes[""] - sum([max_memory[i] for i in range(1, num_devices)]))
@@ -1107,10 +1237,14 @@ def load_checkpoint_in_model(
 
                 if param_device == "disk":
                     if offload_buffers or param_name not in buffer_names:
-                        set_module_tensor_to_device(model, param_name, "meta")
+                        if dtype is None:
+                            dtype = param.dtype
+                        set_module_tensor_to_device(model, param_name, "meta", dtype=dtype)
                     offload_weight(param, param_name, offload_folder, index=offload_index)
                 elif param_device == "cpu" and offload_state_dict:
-                    set_module_tensor_to_device(model, param_name, "meta")
+                    if dtype is None:
+                        dtype = param.dtype
+                    set_module_tensor_to_device(model, param_name, "meta", dtype=dtype)
                     offload_weight(param, param_name, state_dict_folder, index=state_dict_index)
                 else:
                     set_module_tensor_to_device(model, param_name, param_device, value=param, dtype=dtype)
@@ -1141,7 +1275,7 @@ def get_mixed_precision_context_manager(native_amp: bool = False, cache_enabled:
     """
     state = AcceleratorState()
     if native_amp:
-        if state.mixed_precision == "fp16" and is_torch_version(">=", "1.10"):
+        if state.mixed_precision == "fp16":
             return torch.autocast(device_type=state.device.type, dtype=torch.float16, cache_enabled=cache_enabled)
         elif state.mixed_precision == "bf16" and state.distributed_type in [
             DistributedType.NO,

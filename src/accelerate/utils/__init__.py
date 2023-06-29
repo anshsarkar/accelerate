@@ -1,4 +1,15 @@
-from .constants import MODEL_NAME, OPTIMIZER_NAME, RNG_STATE_NAME, SCALER_NAME, SCHEDULER_NAME, TORCH_LAUNCH_PARAMS
+from .constants import (
+    MODEL_NAME,
+    OPTIMIZER_NAME,
+    RNG_STATE_NAME,
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    SCALER_NAME,
+    SCHEDULER_NAME,
+    TORCH_LAUNCH_PARAMS,
+    WEIGHTS_INDEX_NAME,
+    WEIGHTS_NAME,
+)
 from .dataclasses import (
     ComputeEnvironment,
     DeepSpeedPlugin,
@@ -57,6 +68,7 @@ from .modeling import (
     get_max_layer_size,
     get_max_memory,
     get_mixed_precision_context_manager,
+    id_tensor_storage,
     infer_auto_device_map,
     load_checkpoint_in_model,
     load_offloaded_weights,
@@ -64,6 +76,7 @@ from .modeling import (
     named_module_tensors,
     retie_parameters,
     set_module_tensor_to_device,
+    shard_checkpoint,
 )
 from .offload import (
     OffloadedWeightsLoader,
@@ -114,7 +127,6 @@ from .fsdp_utils import load_fsdp_model, load_fsdp_optimizer, save_fsdp_model, s
 from .launch import (
     PrepareForLaunch,
     _filter_args,
-    get_launch_prefix,
     prepare_deepspeed_cmd_env,
     prepare_multi_gpu_env,
     prepare_sagemager_args_inputs,
@@ -143,6 +155,7 @@ from .memory import find_executable_batch_size, release_memory
 from .other import (
     extract_model_from_parallel,
     get_pretty_name,
+    is_port_in_use,
     merge_dicts,
     patch_environment,
     save,
