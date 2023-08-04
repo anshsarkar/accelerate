@@ -33,6 +33,7 @@ from accelerate.utils import (
     gather,
     is_bf16_available,
     is_ipex_available,
+    is_npu_available,
     is_xpu_available,
     set_seed,
     synchronize_rng_states,
@@ -358,7 +359,7 @@ def training_check():
 
     accelerator.print("Training yielded the same results on one CPU or distributes setup with batch split.")
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or is_npu_available():
         # Mostly a test that FP16 doesn't crash as the operation inside the model is not converted to FP16
         print("FP16 training check.")
         AcceleratorState._reset_state()
@@ -381,6 +382,21 @@ def training_check():
         model = accelerator.unwrap_model(model).cpu()
         assert torch.allclose(old_model.a, model.a), "Did not obtain the same model on CPU or distributed training."
         assert torch.allclose(old_model.b, model.b), "Did not obtain the same model on CPU or distributed training."
+
+    if torch.cuda.is_available():
+        # Mostly a test that model.forward will have autocast when running unwrap_model(model, keep_fp32_wrapper=True)
+        print("Keep fp32 wrapper check.")
+        AcceleratorState._reset_state()
+        accelerator = Accelerator(mixed_precision="fp16")
+
+        model = torch.nn.Linear(2, 4)
+        model = accelerator.prepare(model)
+        model_with_fp32_wrapper = accelerator.unwrap_model(model, keep_fp32_wrapper=True)
+
+        # Run forward with fp16 as input.
+        # When the model is with mixed precision wrapper, no error will be raised.
+        input_tensor = torch.Tensor([1, 2]).to(dtype=torch.float16, device=accelerator.device)
+        output = model_with_fp32_wrapper(input_tensor)
 
     # BF16 support is only for CPU + TPU, and some GPU
     if is_bf16_available():
@@ -464,7 +480,7 @@ def test_split_between_processes_list():
             len(results) == 2
         ), f"Each process did not have two items. Process index: {state.process_index}; Length: {len(results)}"
 
-    data = list(range(0, (2 * state.num_processes) + 3))
+    data = list(range(0, (3 * state.num_processes) - 1))
     with state.split_between_processes(data, apply_padding=True) as results:
         if state.is_last_process:
             # Test that the last process gets the extra item(s)
@@ -477,35 +493,38 @@ def test_split_between_processes_list():
 
 def test_split_between_processes_nested_dict():
     state = AcceleratorState()
+    a = [1, 2, 3, 4, 5, 6, 7, 8]
+    b = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    c = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
     if state.num_processes in (1, 2, 4):
-        data = {"a": [1, 2, 3, 4], "b": ["w", "x", "y", "z"], "c": torch.tensor([0, 1, 2, 3])}
+        data = {"a": a, "b": b, "c": c}
         data_copy = deepcopy(data)
         with state.split_between_processes(data) as results:
             if state.process_index == 0:
-                assert results["a"] == data_copy["a"][: 4 // state.num_processes]
+                assert results["a"] == data_copy["a"][: 8 // state.num_processes]
             elif state.num_processes == 2:
-                assert results["a"] == data_copy["a"][2:]
+                assert results["a"] == data_copy["a"][4:]
             elif state.process_index == 3:
                 # We return a list each time
-                assert results["a"] == data_copy["a"][-1:], f'Expected: {data_copy["a"][-1]}, Actual: {results["a"]}'
+                assert results["a"] == data_copy["a"][-2:], f'Expected: {data_copy["a"][-2]}, Actual: {results["a"]}'
             if state.process_index == 0:
-                assert results["b"] == data_copy["b"][: 4 // state.num_processes]
+                assert results["b"] == data_copy["b"][: 8 // state.num_processes]
             elif state.num_processes == 2:
-                assert results["b"] == data_copy["b"][2:]
+                assert results["b"] == data_copy["b"][4:]
             elif state.process_index == 3:
-                assert results["b"] == data_copy["b"][-1:]
+                assert results["b"] == data_copy["b"][-2:]
             if state.process_index == 0:
                 assert torch.allclose(
-                    results["c"], data_copy["c"][: 4 // state.num_processes]
-                ), f"Did not obtain expected values on process 0, expected `{data['c'][:4//state.num_processes]}`, received: {results['c']}"
+                    results["c"], data_copy["c"][: 8 // state.num_processes]
+                ), f"Did not obtain expected values on process 0, expected `{data['c'][:8 // state.num_processes]}`, received: {results['c']}"
             elif state.num_processes == 2:
                 assert torch.allclose(
-                    results["c"], data_copy["c"][2:]
-                ), f"Did not obtain expected values on process 2, expected `{data['c'][2:]}`, received: {results['c']}"
+                    results["c"], data_copy["c"][4:]
+                ), f"Did not obtain expected values on process 2, expected `{data['c'][4:]}`, received: {results['c']}"
             elif state.process_index == 3:
                 assert torch.allclose(
-                    results["c"], data_copy["c"][3]
-                ), f"Did not obtain expected values on process 4, expected `{data['c'][3]}`, received: {results['c']}"
+                    results["c"], data_copy["c"][-2:]
+                ), f"Did not obtain expected values on process 4, expected `{data['c'][-2:]}`, received: {results['c']}"
 
     state.wait_for_everyone()
 

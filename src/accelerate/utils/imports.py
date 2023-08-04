@@ -103,7 +103,29 @@ def is_bf16_available(ignore_tpu=False):
         return not ignore_tpu
     if torch.cuda.is_available():
         return torch.cuda.is_bf16_supported()
+    if is_npu_available():
+        return False
     return True
+
+
+def is_4bit_bnb_available():
+    package_exists = _is_package_available("bitsandbytes")
+    if package_exists:
+        bnb_version = version.parse(importlib.metadata.version("bitsandbytes"))
+        return compare_versions(bnb_version, ">=", "0.39.0")
+    return False
+
+
+def is_8bit_bnb_available():
+    package_exists = _is_package_available("bitsandbytes")
+    if package_exists:
+        bnb_version = version.parse(importlib.metadata.version("bitsandbytes"))
+        return compare_versions(bnb_version, ">=", "0.37.2")
+    return False
+
+
+def is_bnb_available():
+    return _is_package_available("bitsandbytes")
 
 
 def is_megatron_lm_available():
@@ -131,7 +153,11 @@ def is_datasets_available():
 
 
 def is_aim_available():
-    return _is_package_available("aim")
+    package_exists = _is_package_available("aim")
+    if package_exists:
+        aim_version = version.parse(importlib.metadata.version("aim"))
+        return compare_versions(aim_version, "<", "4.0.0")
+    return False
 
 
 def is_tensorboard_available():
@@ -198,6 +224,25 @@ def is_ipex_available():
         )
         return False
     return True
+
+
+@lru_cache
+def is_npu_available(check_device=False):
+    "Checks if `torch_npu` is installed and potentially if a NPU is in the environment"
+    if importlib.util.find_spec("torch") is None or importlib.util.find_spec("torch_npu") is None:
+        return False
+
+    import torch
+    import torch_npu  # noqa: F401
+
+    if check_device:
+        try:
+            # Will raise a RuntimeError if no NPU is found
+            _ = torch.npu.device_count()
+            return torch.npu.is_available()
+        except RuntimeError:
+            return False
+    return hasattr(torch, "npu") and torch.npu.is_available()
 
 
 @lru_cache

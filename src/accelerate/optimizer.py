@@ -60,6 +60,11 @@ class AcceleratedOptimizer(torch.optim.Optimizer):
         self.device_placement = device_placement
         self._is_overflow = False
 
+        if self.scaler is not None:
+            self._accelerate_step_called = False
+            self._optimizer_original_step_method = self.optimizer.step
+            self._optimizer_patched_step_method = patch_optimizer_step(self, self.optimizer.step)
+
         # Handle device placement
         if device_placement:
             state_dict = self.optimizer.state_dict()
@@ -122,12 +127,20 @@ class AcceleratedOptimizer(torch.optim.Optimizer):
                 optimizer_args = {"closure": closure} if closure is not None else {}
                 xm.optimizer_step(self.optimizer, optimizer_args=optimizer_args)
             elif self.scaler is not None:
-                scale_before = self.scaler.get_scale()
+                self.optimizer.step = self._optimizer_patched_step_method
+
                 self.scaler.step(self.optimizer, closure)
                 self.scaler.update()
-                scale_after = self.scaler.get_scale()
-                # If we reduced the loss scale, it means the optimizer step was skipped because of gradient overflow.
-                self._is_overflow = scale_after < scale_before
+
+                if not self._accelerate_step_called:
+                    # If the optimizer step was skipped, gradient overflow was detected.
+                    self._is_overflow = True
+                else:
+                    self._is_overflow = False
+                # Reset the step method to the original one
+                self.optimizer.step = self._optimizer_original_step_method
+                # Reset the indicator
+                self._accelerate_step_called = False
             else:
                 self.optimizer.step(closure)
 
@@ -151,7 +164,24 @@ class AcceleratedOptimizer(torch.optim.Optimizer):
         return self._is_overflow
 
     def __getstate__(self):
-        return self.__dict__.copy()
+        _ignored_keys = [
+            "_accelerate_step_called",
+            "_optimizer_original_step_method",
+            "_optimizer_patched_step_method",
+        ]
+        return {k: v for k, v in self.__dict__.items() if k not in _ignored_keys}
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        if self.scaler is not None:
+            self._accelerate_step_called = False
+            self._optimizer_original_step_method = self.optimizer.step
+            self._optimizer_patched_step_method = patch_optimizer_step(self, self.optimizer.step)
+
+
+def patch_optimizer_step(accelerated_optimizer: AcceleratedOptimizer, method):
+    def patched_step(*args, **kwargs):
+        accelerated_optimizer._accelerate_step_called = True
+        return method(*args, **kwargs)
+
+    return patched_step

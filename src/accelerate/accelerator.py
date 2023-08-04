@@ -45,6 +45,7 @@ from .utils import (
     SAFE_WEIGHTS_NAME,
     WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
+    AutocastKwargs,
     DeepSpeedPlugin,
     DistributedDataParallelKwargs,
     DistributedType,
@@ -75,6 +76,7 @@ from .utils import (
     is_fp8_available,
     is_ipex_available,
     is_megatron_lm_available,
+    is_npu_available,
     is_safetensors_available,
     is_torch_version,
     is_tpu_available,
@@ -97,7 +99,6 @@ from .utils.constants import FSDP_PYTORCH_VERSION
 
 if is_deepspeed_available():
     import deepspeed
-    from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
     from .utils import (
         DeepSpeedEngineWrapper,
@@ -328,6 +329,7 @@ class Accelerator:
         self.scaler_handler = None
         self.init_handler = None
         self.fp8_recipe_handler = None
+        self.autocast_handler = None
         if kwargs_handlers is not None:
             for handler in kwargs_handlers:
                 assert isinstance(
@@ -353,6 +355,11 @@ class Accelerator:
                         raise ValueError("You can only pass one `FP8RecipeKwargs` in `kwargs_handler`.")
                     else:
                         self.fp8_recipe_handler = handler
+                elif isinstance(handler, AutocastKwargs):
+                    if self.autocast_handler is not None:
+                        raise ValueError("You can only pass one `AutocastKwargs` in `kwargs_handler`.")
+                    else:
+                        self.autocast_handler = handler
 
         kwargs = self.init_handler.to_kwargs() if self.init_handler is not None else {}
         self.state = AcceleratorState(
@@ -414,13 +421,15 @@ class Accelerator:
             and self.distributed_type not in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM)
         ):
             self.native_amp = True
-            if self.device.type not in ("cuda", "mps"):
+            if self.device.type not in ("cuda", "mps", "npu"):
                 raise ValueError(err.format(mode="fp16", requirement="a GPU"))
             kwargs = self.scaler_handler.to_kwargs() if self.scaler_handler is not None else {}
             if self.distributed_type == DistributedType.FSDP:
                 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
                 self.scaler = ShardedGradScaler(**kwargs)
+            elif is_npu_available():
+                self.scaler = torch.npu.amp.GradScaler(**kwargs)
             else:
                 self.scaler = torch.cuda.amp.GradScaler(**kwargs)
 
@@ -860,6 +869,55 @@ class Accelerator:
         with context():
             yield
 
+    @staticmethod
+    @contextmanager
+    def trigger_sync_in_backward(model):
+        """Trigger the sync of the gradients in the next backward pass of the model after multiple forward passes under
+        `Accelerator.no_sync` (only applicable in multi-GPU scenarios).
+
+                If the script is not launched in distributed mode, this context manager does nothing.
+
+                Args:
+                    model (`torch.nn.Module`):
+                        The model for which to trigger the gradient synchronization.
+
+                Example:
+
+                ```python
+                >>> from accelerate import Accelerator
+
+                >>> accelerator = Accelerator()
+                >>> dataloader, model, optimizer = accelerator.prepare(dataloader, model, optimizer)
+
+                >>> with accelerator.no_sync():
+                ...     loss_a = loss_func(model(input_a))  # first forward pass
+                ...     loss_b = loss_func(model(input_b))  # second forward pass
+                >>> accelerator.backward(loss_a)  # No synchronization across processes, only accumulate gradients
+                >>> with accelerator.trigger_sync_in_backward(model):
+                ...     accelerator.backward(loss_b)  # Synchronization across all processes
+                >>> optimizer.step()
+                >>> optimizer.zero_grad()
+                ```
+        """
+        if not isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            yield
+            return
+
+        old_require_backward_grad_sync = model.require_backward_grad_sync
+        old_require_forward_param_sync = model.require_forward_param_sync
+
+        # EXPERIMENTAL: This will force grad sync during `backward()`, but it is unknown if it breaks other DDP features.
+        # https://github.com/pytorch/pytorch/blob/e1502c0cdbfd17548c612f25d5a65b1e4b86224d/torch/nn/parallel/distributed.py#L1453-L1466
+        model.require_backward_grad_sync = True
+        model.require_forward_param_sync = True
+        # https://github.com/pytorch/pytorch/blob/e1502c0cdbfd17548c612f25d5a65b1e4b86224d/torch/csrc/distributed/c10d/reducer.cpp#L1371-L1402
+        model.reducer.prepare_for_backward([])
+        try:
+            yield
+        finally:
+            model.require_backward_grad_sync = old_require_backward_grad_sync
+            model.require_forward_param_sync = old_require_forward_param_sync
+
     def _do_sync(self):
         "Sets the right `sync_gradients` context and either resets or increases `self.step`"
         if self.gradient_state.sync_with_dataloader and self.gradient_state.end_of_dataloader:
@@ -886,13 +944,14 @@ class Accelerator:
         self.gradient_state.plugin_kwargs.update({"num_steps": gradient_accumulation_steps})
 
     @contextmanager
-    def accumulate(self, model):
+    def accumulate(self, *models):
         """
         A context manager that will lightly wrap around and perform gradient accumulation automatically
 
         Args:
-            model (`torch.nn.Module`):
-                PyTorch Module that was prepared with `Accelerator.prepare`
+            *models (list of `torch.nn.Module`):
+                PyTorch Modules that was prepared with `Accelerator.prepare`. Models passed to `accumulate()` will skip
+                gradient syncing during backward pass in distributed training
 
         Example:
 
@@ -913,12 +972,9 @@ class Accelerator:
         ```
         """
         self._do_sync()
-        if self.sync_gradients:
-            context = contextlib.nullcontext
-        else:
-            context = self.no_sync
-
-        with context(model):
+        with contextlib.ExitStack() as cm_stack:
+            for m in models:
+                cm_stack.enter_context(contextlib.nullcontext() if self.sync_gradients else self.no_sync(m))
             yield
 
     @contextmanager
@@ -966,7 +1022,7 @@ class Accelerator:
         ...         optimizer.zero_grad()
         ```
         """
-        if self.distributed_type in (DistributedType.MULTI_GPU, DistributedType.MULTI_XPU):
+        if self.distributed_type in (DistributedType.MULTI_GPU, DistributedType.MULTI_NPU, DistributedType.MULTI_XPU):
             dl_even_batches_values = []
 
             if even_batches is not None:
@@ -1138,11 +1194,15 @@ class Accelerator:
             )
 
         if self.distributed_type == DistributedType.FSDP:
+            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
             model_count = 0
             optimizer_present = False
+            is_type_fsdp = False
             for obj in args:
                 if isinstance(obj, torch.nn.Module):
                     model_count += 1
+                    is_type_fsdp = type(obj) == FSDP
                 if isinstance(obj, torch.optim.Optimizer):
                     optimizer_present = True
             if model_count > 1 and optimizer_present:
@@ -1151,7 +1211,7 @@ class Accelerator:
                     "prepare must be called for all the models before optimizers are created. "
                     "Then pass the optimizers to the prepare call in the same order as corresponding models."
                 )
-            elif model_count == 1 and optimizer_present:
+            elif model_count == 1 and not is_type_fsdp and optimizer_present:
                 logger.warning(
                     "FSDP Warning: When using FSDP, "
                     "it is efficient and recommended to call prepare for the model before creating the optimizer"
@@ -1212,7 +1272,12 @@ class Accelerator:
                 if isinstance(obj, torch.optim.Optimizer):
                     obj._switch_parameters(mapping)
 
-        if self.distributed_type == DistributedType.FSDP and model_count == 1 and optimizer_present:
+        if (
+            self.distributed_type == DistributedType.FSDP
+            and model_count == 1
+            and not is_type_fsdp
+            and optimizer_present
+        ):
             result = self._prepare_fsdp(*result)
 
         for item in result:
@@ -1289,49 +1354,11 @@ class Accelerator:
         elif device_placement and not has_hf_device_map:
             model = model.to(self.device)
 
-        if not evaluation_mode:
-            if self.distributed_type in (DistributedType.MULTI_GPU, DistributedType.MULTI_XPU):
-                if any(p.requires_grad for p in model.parameters()):
-                    kwargs = self.ddp_handler.to_kwargs() if self.ddp_handler is not None else {}
-                    model = torch.nn.parallel.DistributedDataParallel(
-                        model, device_ids=[self.local_process_index], output_device=self.local_process_index, **kwargs
-                    )
-            elif self.distributed_type == DistributedType.FSDP:
-                from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-
-                # Check if the model is already a FSDP model due to `Manual Wrapping` and if so,
-                # don't wrap it again
-                if type(model) != FSDP:
-                    self.state.fsdp_plugin.set_auto_wrap_policy(model)
-                    fsdp_plugin = self.state.fsdp_plugin
-                    kwargs = {
-                        "sharding_strategy": fsdp_plugin.sharding_strategy,
-                        "cpu_offload": fsdp_plugin.cpu_offload,
-                        "auto_wrap_policy": fsdp_plugin.auto_wrap_policy,
-                        "mixed_precision": fsdp_plugin.mixed_precision_policy,
-                        "sync_module_states": fsdp_plugin.sync_module_states,
-                        "backward_prefetch": fsdp_plugin.backward_prefetch,
-                        "forward_prefetch": fsdp_plugin.forward_prefetch,
-                        "use_orig_params": fsdp_plugin.use_orig_params,
-                        "param_init_fn": fsdp_plugin.param_init_fn,
-                        "ignored_modules": fsdp_plugin.ignored_modules,
-                        "ignored_parameters": fsdp_plugin.ignored_parameters,
-                        "limit_all_gathers": fsdp_plugin.limit_all_gathers,
-                        "device_id": self.device,
-                    }
-                    model = FSDP(model, **kwargs)
-                self._models[-1] = model
-            elif self.distributed_type == DistributedType.MULTI_CPU:
-                kwargs = self.ddp_handler.to_kwargs() if self.ddp_handler is not None else {}
-                model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
         if self.native_amp:
             model._original_forward = model.forward
             model_forward_func = model.forward.__func__ if hasattr(model.forward, "__func__") else model.forward
-            if self.mixed_precision == "fp16":
-                new_forward = torch.cuda.amp.autocast(dtype=torch.float16)(model_forward_func)
-            elif self.mixed_precision == "bf16" and self.distributed_type != DistributedType.TPU:
-                new_forward = torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)(model_forward_func)
-
+            autocast_context = get_mixed_precision_context_manager(self.native_amp, self.autocast_handler)
+            new_forward = autocast_context(model_forward_func)
             if hasattr(model.forward, "__func__"):
                 model.forward = MethodType(new_forward, model)
                 model.forward = MethodType(convert_outputs_to_fp32(model.forward.__func__), model)
@@ -1360,7 +1387,44 @@ class Accelerator:
                 )
             model.forward = fp8_autocast(enabled=fp8_enabled, fp8_recipe=fp8_recipe)(model.forward)
         if not evaluation_mode:
-            if self.distributed_type == DistributedType.TPU and self.state.fork_launched:
+            if self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_NPU,
+                DistributedType.MULTI_XPU,
+            ):
+                if any(p.requires_grad for p in model.parameters()):
+                    kwargs = self.ddp_handler.to_kwargs() if self.ddp_handler is not None else {}
+                    model = torch.nn.parallel.DistributedDataParallel(
+                        model, device_ids=[self.local_process_index], output_device=self.local_process_index, **kwargs
+                    )
+            elif self.distributed_type == DistributedType.FSDP:
+                from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
+                # Check if the model is already a FSDP model due to `Manual Wrapping` and if so,
+                # don't wrap it again
+                if type(model) != FSDP:
+                    self.state.fsdp_plugin.set_auto_wrap_policy(model)
+                    fsdp_plugin = self.state.fsdp_plugin
+                    kwargs = {
+                        "sharding_strategy": fsdp_plugin.sharding_strategy,
+                        "cpu_offload": fsdp_plugin.cpu_offload,
+                        "auto_wrap_policy": fsdp_plugin.auto_wrap_policy,
+                        "mixed_precision": fsdp_plugin.mixed_precision_policy,
+                        "sync_module_states": fsdp_plugin.sync_module_states,
+                        "backward_prefetch": fsdp_plugin.backward_prefetch,
+                        "forward_prefetch": fsdp_plugin.forward_prefetch,
+                        "use_orig_params": fsdp_plugin.use_orig_params,
+                        "param_init_fn": fsdp_plugin.param_init_fn,
+                        "ignored_modules": fsdp_plugin.ignored_modules,
+                        "limit_all_gathers": fsdp_plugin.limit_all_gathers,
+                        "device_id": self.device,
+                    }
+                    model = FSDP(model, **kwargs)
+                self._models[-1] = model
+            elif self.distributed_type == DistributedType.MULTI_CPU:
+                kwargs = self.ddp_handler.to_kwargs() if self.ddp_handler is not None else {}
+                model = torch.nn.parallel.DistributedDataParallel(model, **kwargs)
+            elif self.distributed_type == DistributedType.TPU and self.state.fork_launched:
                 model = xmp.MpModelWrapper(model).to(self.device)
         # torch.compile should be called last.
         if self.state.dynamo_plugin.backend != DynamoBackend.NO:
@@ -2002,19 +2066,25 @@ class Accelerator:
         ```
         """
         tensor = self.gather(tensor)
-        if self.gradient_state.remainder == -1:
-            logger.info(
-                "The used dataset had no length, returning gathered tensors. You should drop the remainder yourself."
-            )
-            return tensor
-        try:
-            # Then see if we're on the last batch of our eval dataloader
-            if self.gradient_state.end_of_dataloader and self.gradient_state.remainder > 0:
-                # Last batch needs to be truncated on distributed systems as it contains additional samples
-                def _adjust_samples(tensor):
-                    return tensor[: self.gradient_state.remainder]
 
-                return recursively_apply(_adjust_samples, tensor)
+        try:
+            if self.gradient_state.end_of_dataloader:
+                # at the end of a dataloader, `gather_for_metrics` regresses to
+                # `gather` unless the dataset has a remainder so log.
+                if self.gradient_state.remainder == -1:
+                    logger.info(
+                        "The used dataset had no length, returning gathered tensors. You should drop the remainder yourself."
+                    )
+                    return tensor
+                elif self.gradient_state.remainder > 0:
+                    # Last batch needs to be truncated on distributed systems as it contains additional samples
+                    def _adjust_samples(tensor):
+                        return tensor[: self.gradient_state.remainder]
+
+                    return recursively_apply(_adjust_samples, tensor)
+                else:  # remainder is 0
+                    # no remainder even though at end of dataloader, so nothing to do.
+                    return tensor
             else:
                 # Not at the end of the dataloader, no need to adjust the tensors
                 return tensor
@@ -2354,8 +2424,10 @@ class Accelerator:
             # Safetensors does not allow tensor aliasing.
             # We're going to remove aliases before saving
             ptrs = collections.defaultdict(list)
+            # when bnb serialization is used the weights in the state dict can be strings
             for name, tensor in state_dict.items():
-                ptrs[id_tensor_storage(tensor)].append(name)
+                if not isinstance(tensor, str):
+                    ptrs[id_tensor_storage(tensor)].append(name)
 
             # These are all the pointers of shared tensors.
             shared_ptrs = {ptr: names for ptr, names in ptrs.items() if len(names) > 1}
@@ -2514,6 +2586,7 @@ class Accelerator:
                 raise ValueError(
                     f"Checkpoint directory {output_dir} ({self.save_iteration}) already exists. Please manually override `self.save_iteration` with what iteration to start with."
                 )
+            self.wait_for_everyone()
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving current state to {output_dir}")
 
@@ -2604,7 +2677,7 @@ class Accelerator:
         self._load_model_state_pre_hook[handle.id] = hook
         return handle
 
-    def load_state(self, input_dir: str, **load_model_func_kwargs):
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
         """
         Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
 
@@ -2617,7 +2690,8 @@ class Accelerator:
 
         Args:
             input_dir (`str` or `os.PathLike`):
-                The name of the folder all relevant weights and states were saved in.
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
             load_model_func_kwargs (`dict`, *optional*):
                 Additional keyword arguments for loading model which can be passed to the underlying load function,
                 such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
@@ -2634,10 +2708,23 @@ class Accelerator:
         >>> accelerator.load_state("my_checkpoint")
         ```
         """
-        # Check if folder exists
-        input_dir = os.path.expanduser(input_dir)
-        if not os.path.isdir(input_dir):
-            raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+
+            folders.sort(key=_inner)
+            input_dir = os.path.join(input_dir, folders[-1])
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
         logger.info(f"Loading states from {input_dir}")
 
         # Load the models taking care of FSDP and DeepSpeed nuances
@@ -2686,7 +2773,10 @@ class Accelerator:
 
         map_location = load_model_func_kwargs.pop("map_location", None)
         if map_location is None:
-            if self.num_processes > 1 and self.distributed_type == DistributedType.MULTI_GPU:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_NPU,
+            ):
                 map_location = "on_device"
             else:
                 map_location = "cpu"
@@ -2824,6 +2914,8 @@ class Accelerator:
                         "To save the full checkpoint, run `model.save_checkpoint(save_dir)` and use `zero_to_fp32.py` to recover weights."
                     )
             else:
+                from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
+
                 state_dict = clone_tensors_for_torch_save(self.unwrap_model(model).state_dict())
         else:
             if unwrap:
@@ -2874,10 +2966,13 @@ class Accelerator:
         self._custom_objects.extend(objects)
 
     @contextmanager
-    def autocast(self, cache_enabled: bool = False):
+    def autocast(self, cache_enabled: bool = False, autocast_handler: AutocastKwargs = None):
         """
         Will apply automatic mixed-precision inside the block inside this context manager, if it is enabled. Nothing
         different will happen otherwise.
+
+        A different `autocast_handler` can be passed in to override the one set in the `Accelerator` object. This is
+        useful in blocks under `autocast` where you want to revert to fp32.
 
         Example:
 
@@ -2889,7 +2984,19 @@ class Accelerator:
         ...     train()
         ```
         """
-        autocast_context = get_mixed_precision_context_manager(self.native_amp, cache_enabled=cache_enabled)
+        if cache_enabled:
+            warnings.warn(
+                "Passing `cache_enabled=True` to `accelerator.autocast` is deprecated and will be removed in v0.23.0. "
+                "Please use the `AutocastKwargs` class instead and pass it to the `Accelerator` as a `kwarg_handler`.",
+                FutureWarning,
+            )
+            if self.autocast_handler is not None:
+                self.autocast_handler.cache_enabled = True
+            else:
+                self.autocast_handler = AutocastKwargs(cache_enabled=True)
+        if autocast_handler is None:
+            autocast_handler = self.autocast_handler
+        autocast_context = get_mixed_precision_context_manager(self.native_amp, autocast_handler)
         autocast_context.__enter__()
         yield
         autocast_context.__exit__(*sys.exc_info())
@@ -2936,3 +3043,7 @@ class Accelerator:
         ```
         """
         return skip_first_batches(dataloader, num_batches=num_batches)
+
+    def __deepcopy__(self, memo):
+        logger.info("Deep copying the `Accelerator` object, note that this will point to the same original object.")
+        return self

@@ -46,9 +46,35 @@ class KwargsHandler:
         """
         Returns a dictionary containing the attributes with values different from the default of this class.
         """
-        default_dict = self.__class__().to_dict()
+        # import clear_environment here to avoid circular import problem
+        from .other import clear_environment
+
+        with clear_environment():
+            default_dict = self.__class__().to_dict()
         this_dict = self.to_dict()
         return {k: v for k, v in this_dict.items() if default_dict[k] != v}
+
+
+@dataclass
+class AutocastKwargs(KwargsHandler):
+    """
+    Use this object in your [`Accelerator`] to customize how `torch.autocast` behaves. Please refer to the
+    documentation of this [context manager](https://pytorch.org/docs/stable/amp.html#torch.autocast) for more
+    information on each argument.
+
+    Example:
+
+    ```python
+    from accelerate import Accelerator
+    from accelerate.utils import AutocastKwargs
+
+    kwargs = AutocastKwargs(cache_enabled=True)
+    accelerator = Accelerator(kwargs_handlers=[kwargs])
+    ```
+    """
+
+    enabled: bool = True
+    cache_enabled: bool = None
 
 
 @dataclass
@@ -182,6 +208,7 @@ class DistributedType(str, enum.Enum):
         - **NO** -- Not a distributed environment, just a single process.
         - **MULTI_CPU** -- Distributed on multiple CPU nodes.
         - **MULTI_GPU** -- Distributed on multiple GPUs.
+        - **MULTI_NPU** -- Distributed on multiple NPUs.
         - **MULTI_XPU** -- Distributed on multiple XPUs.
         - **DEEPSPEED** -- Using DeepSpeed.
         - **TPU** -- Distributed on TPUs.
@@ -191,6 +218,7 @@ class DistributedType(str, enum.Enum):
     NO = "NO"
     MULTI_CPU = "MULTI_CPU"
     MULTI_GPU = "MULTI_GPU"
+    MULTI_NPU = "MULTI_NPU"
     MULTI_XPU = "MULTI_XPU"
     DEEPSPEED = "DEEPSPEED"
     FSDP = "FSDP"
@@ -335,9 +363,18 @@ class PrecisionType(BaseEnum):
 class RNGType(BaseEnum):
     TORCH = "torch"
     CUDA = "cuda"
+    NPU = "npu"
     XLA = "xla"
     XPU = "xpu"
     GENERATOR = "generator"
+
+
+class CustomDtype(enum.Enum):
+    r"""
+    An enum that contains multiple custom dtypes that can be used for `infer_auto_device_map`.
+    """
+    FP8 = "fp8"
+    INT4 = "int4"
 
 
 # data classes
@@ -779,10 +816,6 @@ class FullyShardedDataParallelPlugin:
         default=None,
         metadata={"help": "A list of modules to ignore for FSDP."},
     )
-    ignored_parameters: Optional[Iterable[torch.nn.Parameter]] = field(
-        default=None,
-        metadata={"help": "A list of parameters to ignore for FSDP."},
-    )
     state_dict_type: "typing.Any" = field(
         default=None,
         metadata={
@@ -902,10 +935,15 @@ class FullyShardedDataParallelPlugin:
     def set_auto_wrap_policy(self, model):
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
+        default_transformer_cls_names_to_wrap = (
+            ",".join(model._no_split_modules) if getattr(model, "_no_split_modules", None) is not None else ""
+        )
         if self.auto_wrap_policy is None:
             auto_wrap_policy = os.environ.get("FSDP_AUTO_WRAP_POLICY", "NO_WRAP")
             if auto_wrap_policy == FSDP_AUTO_WRAP_POLICY[0]:
-                transformer_cls_names_to_wrap = os.environ.get("FSDP_TRANSFORMER_CLS_TO_WRAP", "").split(",")
+                transformer_cls_names_to_wrap = os.environ.get(
+                    "FSDP_TRANSFORMER_CLS_TO_WRAP", default_transformer_cls_names_to_wrap
+                ).split(",")
                 transformer_cls_to_wrap = set()
                 for layer_class in transformer_cls_names_to_wrap:
                     transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
@@ -1312,3 +1350,134 @@ class MegatronLMPlugin:
                 self.megatron_lm_default_args[key] = True
             elif key.startswith("no_log_"):
                 self.megatron_lm_default_args[key.replace("no_", "")] = True
+
+
+@dataclass
+class BnbQuantizationConfig:
+    """
+    A plugin to enable BitsAndBytes 4bit and 8bit quantization
+    """
+
+    load_in_8bit: bool = field(default=False, metadata={"help": "enable 8bit quantization."})
+
+    llm_int8_threshold: float = field(
+        default=6.0, metadata={"help": "value of the outliner threshold. only relevant when load_in_8bit=True"}
+    )
+
+    load_in_4bit: bool = field(default=False, metadata={"help": "enable 4bit quantization."})
+
+    bnb_4bit_quant_type: str = field(
+        default="fp4",
+        metadata={
+            "help": "set the quantization data type in the `bnb.nn.Linear4Bit` layers. Options are {'fp4','np4'}."
+        },
+    )
+
+    bnb_4bit_use_double_quant: bool = field(
+        default=False,
+        metadata={
+            "help": "enable nested quantization where the quantization constants from the first quantization are quantized again."
+        },
+    )
+
+    bnb_4bit_compute_dtype: bool = field(
+        default="fp16",
+        metadata={
+            "help": "This sets the computational type which might be different than the input time. For example, inputs might be "
+            "fp32, but computation can be set to bf16 for speedups. Options are {'fp32','fp16','bf16'}."
+        },
+    )
+
+    torch_dtype: torch.dtype = field(
+        default=None,
+        metadata={
+            "help": "this sets the dtype of the remaining non quantized layers. `bitsandbytes` library suggests to set the value"
+            "to `torch.float16` for 8 bit model and use the same dtype as the compute dtype for 4 bit model "
+        },
+    )
+
+    skip_modules: List[str] = field(
+        default=None,
+        metadata={
+            "help": "an explicit list of the modules that we don't quantize. The dtype of these modules will be `torch_dtype`."
+        },
+    )
+
+    keep_in_fp32_modules: List[str] = field(
+        default=None,
+        metadata={"help": "an explicit list of the modules that we don't quantize. We keep them in `torch.float32`."},
+    )
+
+    def __post_init__(self):
+        """
+        Safety checker that arguments are correct - also replaces some NoneType arguments with their default values.
+        """
+        if not isinstance(self.load_in_8bit, bool):
+            raise ValueError("load_in_8bit must be a boolean")
+
+        if not isinstance(self.load_in_4bit, bool):
+            raise ValueError("load_in_4bit must be a boolean")
+
+        if self.load_in_4bit and self.load_in_8bit:
+            raise ValueError("load_in_4bit and load_in_8 can't be both True")
+
+        if not self.load_in_4bit and not self.load_in_8bit:
+            raise ValueError("load_in_4bit and load_in_8 can't be both False")
+
+        if not isinstance(self.llm_int8_threshold, (int, float)):
+            raise ValueError("llm_int8_threshold must be a float or an int")
+
+        if not isinstance(self.bnb_4bit_quant_type, str):
+            raise ValueError("bnb_4bit_quant_type must be a string")
+        elif self.bnb_4bit_quant_type not in ["fp4", "nf4"]:
+            raise ValueError(f"bnb_4bit_quant_type must be in ['fp4','nf4'] but found {self.bnb_4bit_quant_type}")
+
+        if not isinstance(self.bnb_4bit_use_double_quant, bool):
+            raise ValueError("bnb_4bit_use_double_quant must be a boolean")
+
+        if isinstance(self.bnb_4bit_compute_dtype, str):
+            if self.bnb_4bit_compute_dtype == "fp32":
+                self.bnb_4bit_compute_dtype = torch.float32
+            elif self.bnb_4bit_compute_dtype == "fp16":
+                self.bnb_4bit_compute_dtype = torch.float16
+            elif self.bnb_4bit_compute_dtype == "bf16":
+                self.bnb_4bit_compute_dtype = torch.bfloat16
+            else:
+                raise ValueError(
+                    f"bnb_4bit_compute_dtype must be in ['fp32','fp16','bf16'] but found {self.bnb_4bit_compute_dtype}"
+                )
+        elif not isinstance(self.bnb_4bit_compute_dtype, torch.dtype):
+            raise ValueError("bnb_4bit_compute_dtype must be a string or a torch.dtype")
+
+        if self.skip_modules is not None and not isinstance(self.skip_modules, list):
+            raise ValueError("skip_modules must be a list of strings")
+
+        if self.keep_in_fp32_modules is not None and not isinstance(self.keep_in_fp32_modules, list):
+            raise ValueError("keep_in_fp_32_modules must be a list of strings")
+
+        if self.load_in_4bit:
+            self.target_dtype = CustomDtype.INT4
+
+        if self.load_in_8bit:
+            self.target_dtype = torch.int8
+
+        if self.load_in_4bit and self.llm_int8_threshold != 6.0:
+            warnings.warn("llm_int8_threshold can only be used for model loaded in 8bit")
+
+        if isinstance(self.torch_dtype, str):
+            if self.torch_dtype == "fp32":
+                self.torch_dtype = torch.float32
+            elif self.torch_dtype == "fp16":
+                self.torch_dtype = torch.float16
+            elif self.torch_dtype == "bf16":
+                self.torch_dtype = torch.bfloat16
+            else:
+                raise ValueError(f"torch_dtype must be in ['fp32','fp16','bf16'] but found {self.torch_dtype}")
+        if self.load_in_8bit and self.torch_dtype is None:
+            self.torch_dtype = torch.float16
+
+        if self.load_in_4bit and self.torch_dtype is None:
+            self.torch_dtype = self.bnb_4bit_compute_dtype
+
+        if not isinstance(self.torch_dtype, torch.dtype):
+            raise ValueError("torch_dtype must be a torch.dtype")

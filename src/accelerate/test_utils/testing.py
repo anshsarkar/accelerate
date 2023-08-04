@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from distutils.util import strtobool
 from functools import partial
 from pathlib import Path
@@ -30,6 +31,7 @@ import torch
 from ..state import AcceleratorState, PartialState
 from ..utils import (
     gather,
+    is_bnb_available,
     is_comet_ml_available,
     is_datasets_available,
     is_deepspeed_available,
@@ -112,6 +114,13 @@ def require_huggingface_suite(test_case):
     return unittest.skipUnless(
         is_transformers_available() and is_datasets_available(), "test requires the Hugging Face suite"
     )(test_case)
+
+
+def require_bnb(test_case):
+    """
+    Decorator marking a test that requires bitsandbytes. These tests are skipped when they are not.
+    """
+    return unittest.skipUnless(is_bnb_available(), "test requires the bitsandbytes library")(test_case)
 
 
 def require_tpu(test_case):
@@ -407,3 +416,18 @@ def run_command(command: List[str], return_stdout=False):
         raise SubprocessCallException(
             f"Command `{' '.join(command)}` failed with the following error:\n\n{e.output.decode()}"
         ) from e
+
+
+@contextmanager
+def assert_exception(exception_class: Exception) -> bool:
+    """
+    Context manager to assert that the right `Exception` class was raised.
+    """
+    was_ran = False
+    try:
+        yield
+        was_ran = True
+    except Exception as e:
+        assert isinstance(e, exception_class), f"Expected exception of type {exception_class} but got {type(e)}"
+    if was_ran:
+        raise AssertionError(f"Expected exception of type {exception_class} but ran without issue.")

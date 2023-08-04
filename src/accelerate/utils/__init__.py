@@ -6,12 +6,16 @@ from .constants import (
     SAFE_WEIGHTS_NAME,
     SCALER_NAME,
     SCHEDULER_NAME,
+    TORCH_DISTRIBUTED_OPERATION_TYPES,
     TORCH_LAUNCH_PARAMS,
     WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
 )
 from .dataclasses import (
+    AutocastKwargs,
+    BnbQuantizationConfig,
     ComputeEnvironment,
+    CustomDtype,
     DeepSpeedPlugin,
     DistributedDataParallelKwargs,
     DistributedType,
@@ -34,8 +38,11 @@ from .dataclasses import (
 from .environment import get_int_from_env, parse_choice_from_env, parse_flag_from_env
 from .imports import (
     get_ccl_version,
+    is_4bit_bnb_available,
+    is_8bit_bnb_available,
     is_aim_available,
     is_bf16_available,
+    is_bnb_available,
     is_boto3_available,
     is_ccl_available,
     is_comet_ml_available,
@@ -46,6 +53,7 @@ from .imports import (
     is_megatron_lm_available,
     is_mlflow_available,
     is_mps_available,
+    is_npu_available,
     is_rich_available,
     is_safetensors_available,
     is_sagemaker_available,
@@ -56,7 +64,6 @@ from .imports import (
     is_xpu_available,
 )
 from .modeling import (
-    CustomDtype,
     check_device_map,
     check_tied_parameters_in_config,
     check_tied_parameters_on_same_device,
@@ -123,6 +130,7 @@ if is_deepspeed_available():
         HfDeepSpeedConfig,
     )
 
+from .bnb import has_4bit_bnb_layers, load_and_quantize_model
 from .fsdp_utils import load_fsdp_model, load_fsdp_optimizer, save_fsdp_model, save_fsdp_optimizer
 from .launch import (
     PrepareForLaunch,
@@ -153,6 +161,7 @@ from .megatron_lm import prepare_optimizer as megatron_lm_prepare_optimizer
 from .megatron_lm import prepare_scheduler as megatron_lm_prepare_scheduler
 from .memory import find_executable_batch_size, release_memory
 from .other import (
+    clear_environment,
     extract_model_from_parallel,
     get_pretty_name,
     is_port_in_use,

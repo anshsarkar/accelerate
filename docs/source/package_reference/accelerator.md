@@ -120,21 +120,51 @@ Use [`~Accelerator.wait_for_everyone`] to make sure all processes join that poin
 
 ### Saving and loading
 
-Use [`~Accelerator.unwrap_model`] before saving to remove all special model wrappers added during the distributed process. 
-
 ```python
 model = MyModel()
 model = accelerator.prepare(model)
-# Unwrap
-model = accelerator.unwrap_model(model)
 ```
 
-Use [`~Accelerator.save`] instead of `torch.save`:
+Use [`~Accelerator.save_model`] instead of `torch.save` to save a model. It will remove all model wrappers added during the distributed process, get the state_dict of the model and save it.
 
 ```diff
-  state_dict = model.state_dict()
 - torch.save(state_dict, "my_state.pkl")
-+ accelerator.save(state_dict, "my_state.pkl")
++ accelerator.save_model(model, save_directory)
+```
+
+[`~Accelerator.save_model`] can also save a model into sharded checkpoints or with safetensors format.
+Here is an example: 
+
+```python
+accelerator.save_model(model, save_directory, max_shard_size="1GB", safe_serialization=True)
+```
+
+#### 🤗 Transformers models
+
+If you are using models from the [🤗 Transformers](https://huggingface.co/docs/transformers/) library, you can use the `.save_pretrained()` method.
+
+```python
+from transformers import AutoModel
+
+model = AutoModel.from_pretrained("bert-base-cased")
+model = accelerator.prepare(model)
+
+# ...fine-tune with PyTorch...
+
+unwrapped_model = accelerator.unwrap_model(model)
+unwrapped_model.save_pretrained(
+    "path/to/my_model_directory",
+    is_main_process=accelerator.is_main_process,
+    save_function=accelerator.save,
+)
+```
+
+This will ensure your model stays compatible with other 🤗 Transformers functionality like the `.from_pretrained()` method.
+
+```python
+from transformers import AutoModel
+
+model = AutoModel.from_pretrained("path/to/my_model_directory")
 ```
 
 ### Operations
